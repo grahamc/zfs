@@ -8098,6 +8098,7 @@ typedef struct loadkey_cbdata {
 	boolean_t cb_recursive;
 	boolean_t cb_noop;
 	char *cb_keylocation;
+	char *cb_executable;
 	uint64_t cb_numfailed;
 	uint64_t cb_numattempted;
 } loadkey_cbdata_t;
@@ -8130,7 +8131,7 @@ load_key_callback(zfs_handle_t *zhp, void *data)
 	cb->cb_numattempted++;
 
 	if (cb->cb_loadkey)
-		ret = zfs_crypto_load_key(zhp, cb->cb_noop, cb->cb_keylocation);
+		ret = zfs_crypto_load_key(zhp, cb->cb_noop, cb->cb_keylocation, cb->cb_executable);
 	else
 		ret = zfs_crypto_unload_key(zhp);
 
@@ -8151,7 +8152,7 @@ load_unload_keys(int argc, char **argv, boolean_t loadkey)
 
 	cb.cb_loadkey = loadkey;
 
-	while ((c = getopt(argc, argv, "anrL:")) != -1) {
+	while ((c = getopt(argc, argv, "anrL:e:")) != -1) {
 		/* noop and alternate keylocations only apply to zfs load-key */
 		if (loadkey) {
 			switch (c) {
@@ -8160,6 +8161,9 @@ load_unload_keys(int argc, char **argv, boolean_t loadkey)
 				continue;
 			case 'L':
 				cb.cb_keylocation = optarg;
+				continue;
+			case 'e':
+				cb.cb_executable = optarg;
 				continue;
 			default:
 				break;
@@ -8292,7 +8296,7 @@ zfs_do_change_key(int argc, char **argv)
 	if (loadkey) {
 		keystatus = zfs_prop_get_int(zhp, ZFS_PROP_KEYSTATUS);
 		if (keystatus != ZFS_KEYSTATUS_AVAILABLE) {
-			ret = zfs_crypto_load_key(zhp, B_FALSE, NULL);
+			ret = zfs_crypto_load_key(zhp, B_FALSE, NULL, NULL);
 			if (ret != 0) {
 				nvlist_free(props);
 				zfs_close(zhp);

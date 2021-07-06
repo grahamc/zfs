@@ -535,7 +535,7 @@ _LIBZFS_H int zfs_crypto_create(libzfs_handle_t *, char *, nvlist_t *,
 _LIBZFS_H int zfs_crypto_clone_check(libzfs_handle_t *, zfs_handle_t *, char *,
     nvlist_t *);
 _LIBZFS_H int zfs_crypto_attempt_load_keys(libzfs_handle_t *, char *);
-_LIBZFS_H int zfs_crypto_load_key(zfs_handle_t *, boolean_t, char *);
+_LIBZFS_H int zfs_crypto_load_key(zfs_handle_t *, boolean_t, char *, char *);
 _LIBZFS_H int zfs_crypto_unload_key(zfs_handle_t *);
 _LIBZFS_H int zfs_crypto_rewrap(zfs_handle_t *, nvlist_t *, boolean_t);
 

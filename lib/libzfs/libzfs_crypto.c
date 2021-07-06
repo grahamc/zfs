@@ -21,6 +21,7 @@
 #include <sys/zfs_context.h>
 #include <sys/fs/zfs.h>
 #include <sys/dsl_crypt.h>
+#include <sys/wait.h>
 #include <libintl.h>
 #include <termios.h>
 #include <signal.h>
@@ -472,6 +473,107 @@ out:
 }
 
 static int
+execute_key_provider_exec(libzfs_handle_t *hdl, const char *executable,
+    const char *fsname, zfs_keyformat_t keyformat, int *outfd)
+{
+	int ret = 0, status, compipe[2];
+	char * const argv[] =
+	    {(char *)executable, (char *)fsname, /*(char *)keyformat,*/ NULL};
+	pid_t child;
+
+	if (pipe2(compipe, O_NONBLOCK | O_CLOEXEC) != 0) {
+		ret = errno;
+		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+		    "Failed to create key provider pipes: %s"), strerror(ret));
+		return (ret);
+	}
+
+	switch ((child = fork())) {
+	case -1:
+		ret = errno;
+		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+		    "Failed to start key provider %s: %s"),
+		    executable, strerror(ret));
+		(void) close(compipe[1]);
+		goto end;
+	case 0: /* child */
+		(void) dup2(compipe[1], 3);
+
+		(void) execvp(executable, argv);
+
+		status = write(3, strerror(errno), strlen(strerror(errno)));
+		_exit(-1);
+	}
+
+	/* parent */
+	(void) close(compipe[1]);
+
+	while (waitpid(child, &status, 0) == -1)
+		if (errno != EINTR) {
+			ret = errno;
+			zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+			    "Failed to wait for key provider %s (%d): %s"),
+			    executable, child, strerror(ret));
+
+			goto end;
+		}
+
+	if (WIFSIGNALED(status)) {
+		ret = EZFS_INTR;
+		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+		    "Key provider %s killed by %s"),
+		    executable, strsignal(WTERMSIG(status)));
+	} else if (WEXITSTATUS(status) == 0xff) {
+		char errbuf[128] = {0};
+		status = read(compipe[0], errbuf, sizeof (errbuf) - 1);
+
+		ret = ENOEXEC;
+		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+		    "Failed to start key provider %s: %s"),
+		    executable, strlen(errbuf) ? errbuf : "(?)");
+	} else if (WEXITSTATUS(status) != 0) {
+		ret = ECANCELED;
+		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+		    "Key provider %s failed with %d"),
+		    executable, WEXITSTATUS(status));
+	}
+
+end:
+	if (ret == 0)
+		*outfd = compipe[0];
+	else
+		(void) close(compipe[0]);
+	errno = 0;
+	return (ret);
+}
+
+static int
+get_key_material_exec(libzfs_handle_t *hdl, char *executable,
+    const char *fsname, zfs_keyformat_t keyformat,
+    uint8_t **restrict buf, size_t *restrict len_out)
+{
+	int ret = 0, rdpipe = -1;
+	FILE *f;
+
+	if ((ret = execute_key_provider_exec(hdl, executable, fsname, keyformat, &rdpipe)) != 0)
+		return (ret);
+
+	if ((f = fdopen(rdpipe, "r")) == NULL) {
+		ret = errno;
+		errno = 0;
+		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+		    "Failed to fdopen key provider pipe"));
+
+		(void) close(rdpipe);
+		return (ret);
+	}
+
+	ret = get_key_material_raw(f, keyformat, buf, len_out);
+	(void) fclose(f);
+	return (ret);
+}
+
+static int
 get_key_material_file(libzfs_handle_t *hdl, const char *uri,
     const char *fsname, zfs_keyformat_t keyformat, boolean_t newkey,
     uint8_t **restrict buf, size_t *restrict len_out)
@@ -677,8 +779,9 @@ end:
  */
 static int
 get_key_material(libzfs_handle_t *hdl, boolean_t do_verify, boolean_t newkey,
-    zfs_keyformat_t keyformat, char *keylocation, const char *fsname,
-    uint8_t **km_out, size_t *kmlen_out, boolean_t *can_retry_out)
+    zfs_keyformat_t keyformat, char *keylocation, char *executable,
+    const char *fsname, uint8_t **km_out, size_t *kmlen_out,
+	boolean_t *can_retry_out)
 {
 	int ret;
 	zfs_keylocation_t keyloc = ZFS_KEYLOCATION_NONE;
@@ -697,7 +800,11 @@ get_key_material(libzfs_handle_t *hdl, boolean_t do_verify, boolean_t newkey,
 	/* open the appropriate file descriptor */
 	switch (keyloc) {
 	case ZFS_KEYLOCATION_PROMPT:
-		if (isatty(fileno(stdin))) {
+		if (executable != NULL) {
+			can_retry = B_TRUE;
+			ret = get_key_material_exec(hdl, executable, fsname,
+			    keyformat, &km, &kmlen);
+		} else if (isatty(fileno(stdin))) {
 			can_retry = keyformat != ZFS_KEYFORMAT_RAW;
 			ret = get_key_interactive(hdl, fsname, keyformat,
 			    do_verify, newkey, &km, &kmlen);
@@ -854,7 +961,7 @@ populate_create_encryption_params_nvlists(libzfs_handle_t *hdl,
 
 	/* get key material from keyformat and keylocation */
 	ret = get_key_material(hdl, B_TRUE, newkey, keyformat, keylocation,
-	    fsname, &key_material, &key_material_len, NULL);
+	    NULL, fsname, &key_material, &key_material_len, NULL);
 	if (ret != 0)
 		goto error;
 
@@ -1214,7 +1321,7 @@ load_keys_cb(zfs_handle_t *zhp, void *arg)
 	/* Attempt to load the key. Record status in cb. */
 	cb->cb_numattempted++;
 
-	ret = zfs_crypto_load_key(zhp, B_FALSE, NULL);
+	ret = zfs_crypto_load_key(zhp, B_FALSE, NULL, NULL);
 	if (ret)
 		cb->cb_numfailed++;
 
@@ -1266,7 +1373,7 @@ error:
 }
 
 int
-zfs_crypto_load_key(zfs_handle_t *zhp, boolean_t noop, char *alt_keylocation)
+zfs_crypto_load_key(zfs_handle_t *zhp, boolean_t noop, char *alt_keylocation, char *executable)
 {
 	int ret, attempts = 0;
 	char errbuf[1024];
@@ -1359,7 +1466,7 @@ try_again:
 
 	/* get key material from key format and location */
 	ret = get_key_material(zhp->zfs_hdl, B_FALSE, B_FALSE, keyformat,
-	    keylocation, zfs_get_name(zhp), &key_material, &key_material_len,
+	    keylocation, executable, zfs_get_name(zhp), &key_material, &key_material_len,
 	    &can_retry);
 	if (ret != 0)
 		goto error;

@@ -463,7 +463,7 @@ zfs_mount_at(zfs_handle_t *zhp, const char *options, int flags,
 				}
 
 				rc = zfs_crypto_load_key(encroot_hp,
-				    B_FALSE, NULL);
+				    B_FALSE, NULL, NULL);
 
 				if (!is_encroot)
 					zfs_close(encroot_hp);
